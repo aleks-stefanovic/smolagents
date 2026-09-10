@@ -35,3 +35,7 @@ available executor implementations.
 ### DockerExecutor
 
 [[autodoc]] smolagents.remote_executors.DockerExecutor
+
+### AgentSandboxExecutor
+
+[[autodoc]] smolagents.remote_executors.AgentSandboxExecutor

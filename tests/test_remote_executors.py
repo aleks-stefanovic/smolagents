@@ -1,5 +1,6 @@
 import importlib
 import io
+import json
 from textwrap import dedent
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,7 @@ from smolagents.default_tools import FinalAnswerTool, WikipediaSearchTool
 from smolagents.local_python_executor import CodeOutput
 from smolagents.monitoring import AgentLogger, LogLevel
 from smolagents.remote_executors import (
+    AgentSandboxExecutor,
     BlaxelExecutor,
     DockerExecutor,
     E2BExecutor,
@@ -615,3 +617,136 @@ class TestBlaxelExecutorUnit:
         assert mock_delete_sandbox.sync.called
         # Verify sandbox reference was cleaned up
         assert not hasattr(executor, "sandbox")
+
+
+def _fake_sandbox(exec_payload=None, exit_code=0):
+    """Sandbox double whose `commands.run` answers REPL exec calls with a canned payload."""
+    payload = (
+        exec_payload
+        if exec_payload is not None
+        else {
+            "logs": "",
+            "output": None,
+            "is_final_answer": False,
+            "error": None,
+        }
+    )
+    sandbox = MagicMock()
+    sandbox.claim_name = "sandbox-claim-abc123"
+
+    def run(command, timeout=None):
+        result = MagicMock()
+        result.exit_code = exit_code
+        result.stderr = ""
+        result.stdout = json.dumps(payload) if " exec " in command else ""
+        return result
+
+    sandbox.commands.run.side_effect = run
+    return sandbox
+
+
+class TestAgentSandboxExecutorUnit:
+    @pytest.fixture
+    def k8s_agent_sandbox(self):
+        module = MagicMock()
+        with patch.dict("sys.modules", {"k8s_agent_sandbox": module}):
+            yield module
+
+    def test_instantiation_without_client_library(self):
+        with patch.dict("sys.modules", {"k8s_agent_sandbox": None}):
+            with pytest.raises(ModuleNotFoundError) as excinfo:
+                AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool")
+        assert "Please install 'agent-sandbox' extra" in str(excinfo.value)
+
+    def test_requires_warmpool_or_claim_name(self, k8s_agent_sandbox):
+        with pytest.raises(ValueError, match="requires either `warmpool` or `claim_name`"):
+            AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), client=MagicMock())
+
+    def test_claims_sandbox_from_warm_pool(self, k8s_agent_sandbox):
+        client = MagicMock()
+        client.create_sandbox.return_value = _fake_sandbox()
+        executor = AgentSandboxExecutor(
+            additional_imports=[],
+            logger=MagicMock(),
+            warmpool="python-pool",
+            namespace="agents",
+            shutdown_after_seconds=600,
+            client=client,
+        )
+        client.create_sandbox.assert_called_once_with(
+            warmpool="python-pool",
+            namespace="agents",
+            sandbox_ready_timeout=180,
+            shutdown_after_seconds=600,
+        )
+        commands = [call.args[0] for call in executor.sandbox.commands.run.call_args_list]
+        assert any("base64 -d > /tmp/smolagents_repl.py" in command for command in commands)
+        assert any("serve 8765" in command for command in commands)
+
+    def test_reattaches_to_existing_claim_and_keeps_it_alive(self, k8s_agent_sandbox):
+        client = MagicMock()
+        sandbox = _fake_sandbox()
+        client.get_sandbox.return_value = sandbox
+        executor = AgentSandboxExecutor(
+            additional_imports=[], logger=MagicMock(), claim_name="existing-claim", client=client
+        )
+        client.get_sandbox.assert_called_once_with("existing-claim", "default")
+        client.create_sandbox.assert_not_called()
+        assert executor.keep_alive is True
+        executor.cleanup()
+        sandbox.close_connection.assert_called_once()
+        sandbox.terminate.assert_not_called()
+
+    def test_run_code_returns_output_and_logs(self, k8s_agent_sandbox):
+        client = MagicMock()
+        client.create_sandbox.return_value = _fake_sandbox(
+            {"logs": "hello\n", "output": "42", "is_final_answer": False, "error": None}
+        )
+        executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        code_output = executor.run_code_raise_errors("print('hello')\n40 + 2")
+        assert code_output.output == "42"
+        assert code_output.logs == "hello\n"
+        assert code_output.is_final_answer is False
+
+    def test_run_code_raises_agent_error(self, k8s_agent_sandbox):
+        client = MagicMock()
+        client.create_sandbox.return_value = _fake_sandbox(
+            {"logs": "partial\n", "output": None, "is_final_answer": False, "error": "ZeroDivisionError"}
+        )
+        executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        with pytest.raises(AgentError, match="ZeroDivisionError"):
+            executor.run_code_raise_errors("1/0")
+
+    def test_run_code_detects_final_answer(self, k8s_agent_sandbox):
+        client = MagicMock()
+        client.create_sandbox.return_value = _fake_sandbox(
+            {"logs": "", "output": "safe:42", "is_final_answer": True, "error": None}
+        )
+        executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        code_output = executor.run_code_raise_errors("final_answer(42)")
+        assert code_output.is_final_answer is True
+        assert code_output.output == 42
+
+    def test_install_packages(self, k8s_agent_sandbox):
+        client = MagicMock()
+        client.create_sandbox.return_value = _fake_sandbox()
+        executor = AgentSandboxExecutor(
+            additional_imports=["pandas", "numpy"], logger=MagicMock(), warmpool="pool", client=client
+        )
+        commands = [call.args[0] for call in executor.sandbox.commands.run.call_args_list]
+        assert any("-m pip install pandas numpy" in command for command in commands)
+        assert executor.installed_packages == ["pandas", "numpy"]
+
+    def test_cleanup_deletes_claimed_sandbox(self, k8s_agent_sandbox):
+        client = MagicMock()
+        sandbox = _fake_sandbox()
+        client.create_sandbox.return_value = sandbox
+        executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        executor.cleanup()
+        sandbox.terminate.assert_called_once()
+
+    def test_failed_command_surfaces_as_agent_error(self, k8s_agent_sandbox):
+        client = MagicMock()
+        client.create_sandbox.return_value = _fake_sandbox(exit_code=1)
+        with pytest.raises(RuntimeError, match="Failed to initialize the sandbox REPL"):
+            AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
