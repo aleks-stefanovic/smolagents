@@ -679,9 +679,12 @@ class TestAgentSandboxExecutorUnit:
             sandbox_ready_timeout=180,
             shutdown_after_seconds=600,
         )
+        executor.sandbox.files.write.assert_called_once()
+        assert executor.sandbox.files.write.call_args.args[0] == "smolagents_repl.py"
         commands = [call.args[0] for call in executor.sandbox.commands.run.call_args_list]
-        assert any("base64 -d > /tmp/smolagents_repl.py" in command for command in commands)
-        assert any("serve 8765" in command for command in commands)
+        assert any("smolagents_repl.py serve 8765" in command for command in commands)
+        # The runtime may execute without a shell, so no command may rely on shell syntax.
+        assert not any(any(token in command for token in ("|", ">", "&", ";")) for command in commands)
 
     def test_reattaches_to_existing_claim_and_keeps_it_alive(self, k8s_agent_sandbox):
         client = MagicMock()
@@ -734,7 +737,7 @@ class TestAgentSandboxExecutorUnit:
             additional_imports=["pandas", "numpy"], logger=MagicMock(), warmpool="pool", client=client
         )
         commands = [call.args[0] for call in executor.sandbox.commands.run.call_args_list]
-        assert any("-m pip install pandas numpy" in command for command in commands)
+        assert any("-m pip install --target /tmp/smolagents-packages pandas numpy" in command for command in commands)
         assert executor.installed_packages == ["pandas", "numpy"]
 
     def test_cleanup_deletes_claimed_sandbox(self, k8s_agent_sandbox):

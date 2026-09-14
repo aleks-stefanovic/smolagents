@@ -1079,8 +1079,10 @@ class BlaxelExecutor(RemotePythonExecutor):
 _AGENT_SANDBOX_REPL = r'''
 """Persistent Python REPL used by smolagents' AgentSandboxExecutor.
 
-Runs as a background daemon inside the Sandbox pod so that variables, imported
-modules and tool definitions survive across separate execution requests.
+Runs as a daemon inside the Sandbox pod so that variables, imported modules and tool
+definitions survive across separate execution requests. Started with "serve", queried with
+"exec". Uses only the standard library, and is driven through single-argument commands so it
+works on sandbox runtimes that execute without a shell.
 """
 
 import ast
@@ -1088,6 +1090,7 @@ import base64
 import contextlib
 import io
 import json
+import os
 import socket
 import sys
 import traceback
@@ -1131,11 +1134,34 @@ def execute(code):
     return {"logs": buffer.getvalue(), "output": output, "is_final_answer": is_final_answer, "error": error}
 
 
-def serve(port):
+def detach():
+    """Double-fork so the invoking command returns instead of blocking on the daemon."""
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+
+
+def serve(port, packages_dir=None):
+    if packages_dir:
+        # Created up front: a sys.path entry that does not exist yet gets a negative finder
+        # cached on the first import, hiding anything installed into it later.
+        os.makedirs(packages_dir, exist_ok=True)
+        sys.path.insert(0, packages_dir)
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", port))
+    try:
+        server.bind(("127.0.0.1", port))
+    except OSError:
+        # A daemon from an earlier session is already serving this sandbox.
+        return
+    # Listening before detaching means the caller cannot race ahead of the accept loop.
     server.listen(8)
+    detach()
     while True:
         connection, _ = server.accept()
         with contextlib.closing(connection):
@@ -1167,7 +1193,7 @@ def request(port, encoded_code):
 
 if __name__ == "__main__":
     if sys.argv[1] == "serve":
-        serve(int(sys.argv[2]))
+        serve(int(sys.argv[2]), sys.argv[3] if len(sys.argv) > 3 else None)
     else:
         request(int(sys.argv[2]), sys.argv[3])
 '''
@@ -1179,10 +1205,14 @@ class AgentSandboxExecutor(RemotePythonExecutor):
     [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller.
 
     Unlike the SaaS-backed executors, this runs on a cluster you operate: code never leaves your
-    network, credentials are supplied by the pod's ServiceAccount rather than an API key, and the
+    network, the sandbox authenticates with its own ServiceAccount rather than an API key, and the
     workload can be hardened with gVisor or Kata. Because a Sandbox is a long-lived pod with
     persistent storage, passing `claim_name` re-attaches to an existing session, so a working
     directory and previously installed packages survive across agent runs.
+
+    The executor uploads a small standard-library REPL into the sandbox and drives it with
+    single-argument commands, so it needs no purpose-built image: any sandbox runtime with a
+    Python interpreter works, with or without a shell.
 
     Args:
         additional_imports (`list[str]`): Additional Python packages to install.
@@ -1204,12 +1234,14 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         sandbox_ready_timeout (`int`, default `180`): Seconds to wait for the Sandbox to become ready.
         keep_alive (`bool`, default `False`): Leave the Sandbox running on cleanup instead of deleting it.
         python_executable (`str`, default `"python3"`): Python interpreter inside the sandbox image.
-        repl_port (`int`, default `8765`): Loopback port the persistent REPL listens on inside the pod.
+        repl_path (`str`, default `"smolagents_repl.py"`): Where to upload the REPL, relative to the sandbox
+            runtime's base directory.
+        repl_port (`int`, default `8765`): Loopback port the REPL listens on inside the pod.
+        packages_path (`str`, default `"/tmp/smolagents-packages"`): Writable directory that `pip install`
+            targets and that the REPL adds to `sys.path`.
         command_timeout (`int`, default `300`): Per-execution timeout in seconds.
         client (*optional*): Pre-built `k8s_agent_sandbox.SandboxClient`, mainly for testing.
     """
-
-    REPL_PATH = "/tmp/smolagents_repl.py"
 
     def __init__(
         self,
@@ -1224,7 +1256,9 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         sandbox_ready_timeout: int = 180,
         keep_alive: bool = False,
         python_executable: str = "python3",
+        repl_path: str = "smolagents_repl.py",
         repl_port: int = 8765,
+        packages_path: str = "/tmp/smolagents-packages",
         command_timeout: int = 300,
         client: Any = None,
     ):
@@ -1241,7 +1275,9 @@ class AgentSandboxExecutor(RemotePythonExecutor):
 
         self.namespace = namespace
         self.python_executable = python_executable
+        self.repl_path = repl_path
         self.repl_port = repl_port
+        self.packages_path = packages_path
         self.command_timeout = command_timeout
         self.keep_alive = keep_alive or claim_name is not None
 
@@ -1278,31 +1314,23 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         return result
 
     def _start_repl(self):
-        encoded_source = base64.b64encode(_AGENT_SANDBOX_REPL.encode("utf-8")).decode("utf-8")
-        self._run_command(f"echo {encoded_source} | base64 -d > {self.REPL_PATH}")
-        # A re-attached session may already be serving, in which case starting a second one would
-        # bind-fail and silently leave the original namespace in place.
-        self._run_command(
-            f"pgrep -f '{self.REPL_PATH} serve' > /dev/null || "
-            f"(nohup {self.python_executable} {self.REPL_PATH} serve {self.repl_port} "
-            f"> /tmp/smolagents_repl.log 2>&1 < /dev/null &)"
-        )
+        self.sandbox.files.write(self.repl_path, _AGENT_SANDBOX_REPL)
+        self._run_command(f"{self.python_executable} {self.repl_path} serve {self.repl_port} {self.packages_path}")
         self._wait_for_repl()
 
-    def _wait_for_repl(self, attempts: int = 30):
+    def _wait_for_repl(self, attempts: int = 10):
         for attempt in range(attempts):
             try:
                 self._request("pass")
                 return
             except Exception:
                 if attempt == attempts - 1:
-                    log = self.sandbox.commands.run("cat /tmp/smolagents_repl.log", timeout=30)
-                    raise RuntimeError(f"REPL did not come up in the sandbox. Log:\n{log.stdout}{log.stderr}")
+                    raise
                 time.sleep(1.0)
 
     def _request(self, code: str) -> dict:
         encoded_code = base64.b64encode(code.encode("utf-8")).decode("utf-8")
-        result = self._run_command(f"{self.python_executable} {self.REPL_PATH} exec {self.repl_port} {encoded_code}")
+        result = self._run_command(f"{self.python_executable} {self.repl_path} exec {self.repl_port} {encoded_code}")
         try:
             return json.loads(result.stdout)
         except ValueError as e:
@@ -1334,11 +1362,14 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         """Install packages with pip inside the sandbox."""
         if not additional_imports:
             return additional_imports
+        # Sandbox images commonly run as a non-root user with no writable site-packages or HOME,
+        # so install into a directory the REPL has already put on sys.path.
         result = self._run_command(
-            f"{self.python_executable} -m pip install {' '.join(additional_imports)}",
+            f"{self.python_executable} -m pip install --target {self.packages_path} {' '.join(additional_imports)}",
             timeout=max(self.command_timeout, 600),
         )
         self.logger.log(result.stdout)
+        self._request("import importlib; importlib.invalidate_caches()")
         return additional_imports
 
     def cleanup(self):
