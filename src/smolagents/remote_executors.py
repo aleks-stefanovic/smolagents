@@ -1076,6 +1076,9 @@ class BlaxelExecutor(RemotePythonExecutor):
             pass  # Silently ignore errors during cleanup
 
 
+_AGENT_SANDBOX_REPL_VERSION = "1"
+_AGENT_SANDBOX_SHUTDOWN = "\x00__SMOLAGENTS_SHUTDOWN__"
+
 _AGENT_SANDBOX_REPL = r'''
 """Persistent Python REPL used by smolagents' AgentSandboxExecutor.
 
@@ -1097,6 +1100,9 @@ import traceback
 
 
 NAMESPACE = {"__name__": "__main__"}
+
+# Carries a NUL so it can never collide with real agent code.
+SHUTDOWN = "\x00__SMOLAGENTS_SHUTDOWN__"
 
 
 def execute(code):
@@ -1146,7 +1152,7 @@ def detach():
         os.dup2(devnull, fd)
 
 
-def serve(port, packages_dir=None):
+def serve(port, packages_dir=None, version=""):
     if packages_dir:
         # Created up front: a sys.path entry that does not exist yet gets a negative finder
         # cached on the first import, hiding anything installed into it later.
@@ -1173,15 +1179,24 @@ def serve(port, packages_dir=None):
                 payload += chunk
             if not payload.strip():
                 continue
-            result = execute(base64.b64decode(payload.strip()).decode("utf-8"))
+            code = base64.b64decode(payload.strip()).decode("utf-8")
+            if code == SHUTDOWN:
+                connection.sendall((json.dumps({"version": version}) + "\n").encode("utf-8"))
+                return
+            result = execute(code)
+            result["version"] = version
             connection.sendall((json.dumps(result) + "\n").encode("utf-8"))
 
 
-def request(port, encoded_code):
+def request(port, argument):
+    # An oversized payload is staged in a file, since a single argv token is bounded by ARG_MAX.
+    if argument.startswith("@"):
+        with open(argument[1:]) as payload_file:
+            argument = payload_file.read().strip()
     client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     client.connect(("127.0.0.1", port))
     with contextlib.closing(client):
-        client.sendall(encoded_code.encode("utf-8") + b"\n")
+        client.sendall(argument.encode("utf-8") + b"\n")
         response = b""
         while not response.endswith(b"\n"):
             chunk = client.recv(65536)
@@ -1193,7 +1208,11 @@ def request(port, encoded_code):
 
 if __name__ == "__main__":
     if sys.argv[1] == "serve":
-        serve(int(sys.argv[2]), sys.argv[3] if len(sys.argv) > 3 else None)
+        serve(
+            int(sys.argv[2]),
+            sys.argv[3] if len(sys.argv) > 3 else None,
+            sys.argv[4] if len(sys.argv) > 4 else "",
+        )
     else:
         request(int(sys.argv[2]), sys.argv[3])
 '''
@@ -1239,6 +1258,10 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         repl_port (`int`, default `8765`): Loopback port the REPL listens on inside the pod.
         packages_path (`str`, default `"/tmp/smolagents-packages"`): Writable directory that `pip install`
             targets and that the REPL adds to `sys.path`.
+        payload_path (`str`, default `"smolagents_payload.b64"`): Where oversized execution payloads are
+            staged, relative to the sandbox runtime's base directory.
+        max_inline_payload (`int`, default `65536`): Payloads longer than this are staged in a file rather
+            than passed as a command argument.
         command_timeout (`int`, default `300`): Per-execution timeout in seconds.
         client (*optional*): Pre-built `k8s_agent_sandbox.SandboxClient`, mainly for testing.
     """
@@ -1259,6 +1282,8 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         repl_path: str = "smolagents_repl.py",
         repl_port: int = 8765,
         packages_path: str = "/tmp/smolagents-packages",
+        payload_path: str = "smolagents_payload.b64",
+        max_inline_payload: int = 64 * 1024,
         command_timeout: int = 300,
         client: Any = None,
     ):
@@ -1278,6 +1303,8 @@ class AgentSandboxExecutor(RemotePythonExecutor):
         self.repl_path = repl_path
         self.repl_port = repl_port
         self.packages_path = packages_path
+        self.payload_path = payload_path
+        self.max_inline_payload = max_inline_payload
         self.command_timeout = command_timeout
         self.keep_alive = keep_alive or claim_name is not None
 
@@ -1315,14 +1342,33 @@ class AgentSandboxExecutor(RemotePythonExecutor):
 
     def _start_repl(self):
         self.sandbox.files.write(self.repl_path, _AGENT_SANDBOX_REPL)
-        self._run_command(f"{self.python_executable} {self.repl_path} serve {self.repl_port} {self.packages_path}")
-        self._wait_for_repl()
+        self._serve_repl()
+        if self._wait_for_repl() == _AGENT_SANDBOX_REPL_VERSION:
+            return
+        # Re-attaching can find a daemon left by an older smolagents, still serving its own REPL
+        # code and package path. Replace it rather than reuse it; its interpreter state is lost.
+        self.logger.log("Replacing an outdated REPL in the sandbox; its state is discarded.", level=LogLevel.INFO)
+        try:
+            self._request(_AGENT_SANDBOX_SHUTDOWN)
+        except Exception:
+            pass
+        self._serve_repl()
+        if self._wait_for_repl() != _AGENT_SANDBOX_REPL_VERSION:
+            raise RuntimeError(
+                f"An outdated REPL is still serving on port {self.repl_port} and would not shut down. "
+                "Claim a new sandbox instead of re-attaching to this one."
+            )
 
-    def _wait_for_repl(self, attempts: int = 10):
+    def _serve_repl(self):
+        self._run_command(
+            f"{self.python_executable} {self.repl_path} serve "
+            f"{self.repl_port} {self.packages_path} {_AGENT_SANDBOX_REPL_VERSION}"
+        )
+
+    def _wait_for_repl(self, attempts: int = 10) -> str:
         for attempt in range(attempts):
             try:
-                self._request("pass")
-                return
+                return self._request("pass").get("version", "")
             except Exception:
                 if attempt == attempts - 1:
                     raise
@@ -1330,7 +1376,13 @@ class AgentSandboxExecutor(RemotePythonExecutor):
 
     def _request(self, code: str) -> dict:
         encoded_code = base64.b64encode(code.encode("utf-8")).decode("utf-8")
-        result = self._run_command(f"{self.python_executable} {self.repl_path} exec {self.repl_port} {encoded_code}")
+        if len(encoded_code) > self.max_inline_payload:
+            # A single argv token is bounded by ARG_MAX, and send_variables can serialize megabytes.
+            self.sandbox.files.write(self.payload_path, encoded_code)
+            argument = f"@{self.payload_path}"
+        else:
+            argument = encoded_code
+        result = self._run_command(f"{self.python_executable} {self.repl_path} exec {self.repl_port} {argument}")
         try:
             return json.loads(result.stdout)
         except ValueError as e:
@@ -1389,7 +1441,11 @@ class AgentSandboxExecutor(RemotePythonExecutor):
 
     def delete(self):
         """Ensure cleanup on deletion."""
+        self.cleanup()
+
+    def __del__(self):
+        """Ensure cleanup on garbage collection."""
         try:
             self.cleanup()
         except Exception:
-            pass
+            pass  # Silently ignore errors during cleanup

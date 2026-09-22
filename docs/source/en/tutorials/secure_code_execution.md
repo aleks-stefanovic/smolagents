@@ -486,7 +486,7 @@ Pass `shutdown_after_seconds` to have the controller delete an idle claim automa
 
 ### Best practices for sandboxes
 
-These key practices apply to Blaxel, E2B, and Docker sandboxes:
+These key practices apply to Blaxel, E2B, Docker, and Agent Sandbox sandboxes:
 
 - Resource management
   - Set memory and CPU limits

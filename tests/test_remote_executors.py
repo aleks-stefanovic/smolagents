@@ -13,6 +13,7 @@ from smolagents.default_tools import FinalAnswerTool, WikipediaSearchTool
 from smolagents.local_python_executor import CodeOutput
 from smolagents.monitoring import AgentLogger, LogLevel
 from smolagents.remote_executors import (
+    _AGENT_SANDBOX_REPL_VERSION,
     AgentSandboxExecutor,
     BlaxelExecutor,
     DockerExecutor,
@@ -631,6 +632,7 @@ def _fake_sandbox(exec_payload=None, exit_code=0):
             "error": None,
         }
     )
+    payload = {"version": _AGENT_SANDBOX_REPL_VERSION, **payload}
     sandbox = MagicMock()
     sandbox.claim_name = "sandbox-claim-abc123"
 
@@ -746,6 +748,66 @@ class TestAgentSandboxExecutorUnit:
         client.create_sandbox.return_value = sandbox
         executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
         executor.cleanup()
+        sandbox.terminate.assert_called_once()
+
+    def test_oversized_payload_is_staged_in_a_file(self, k8s_agent_sandbox):
+        client = MagicMock()
+        sandbox = _fake_sandbox()
+        client.create_sandbox.return_value = sandbox
+        executor = AgentSandboxExecutor(
+            additional_imports=[], logger=MagicMock(), warmpool="pool", max_inline_payload=64, client=client
+        )
+        sandbox.files.write.reset_mock()
+        executor.run_code_raise_errors("x = '" + "a" * 500 + "'")
+        assert "smolagents_payload.b64" in [call.args[0] for call in sandbox.files.write.call_args_list]
+        assert any("exec 8765 @smolagents_payload.b64" in call.args[0] for call in sandbox.commands.run.call_args_list)
+
+    def test_small_payload_stays_inline(self, k8s_agent_sandbox):
+        client = MagicMock()
+        sandbox = _fake_sandbox()
+        client.create_sandbox.return_value = sandbox
+        executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        sandbox.files.write.reset_mock()
+        executor.run_code_raise_errors("1 + 1")
+        sandbox.files.write.assert_not_called()
+
+    def test_outdated_repl_is_replaced(self, k8s_agent_sandbox):
+        """A daemon left by an older smolagents must be restarted, not silently reused."""
+        client = MagicMock()
+        sandbox = _fake_sandbox()
+        versions = iter(["0", "0"])
+
+        def run(command, timeout=None):
+            result = MagicMock()
+            result.exit_code = 0
+            result.stderr = ""
+            if " exec " in command:
+                body = {"logs": "", "output": None, "is_final_answer": False, "error": None}
+                result.stdout = json.dumps({**body, "version": next(versions, _AGENT_SANDBOX_REPL_VERSION)})
+            else:
+                result.stdout = ""
+            return result
+
+        sandbox.commands.run.side_effect = run
+        client.create_sandbox.return_value = sandbox
+        AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        serve_calls = [c.args[0] for c in sandbox.commands.run.call_args_list if " serve " in c.args[0]]
+        assert len(serve_calls) == 2
+        assert all(command.endswith(_AGENT_SANDBOX_REPL_VERSION) for command in serve_calls)
+
+    def test_outdated_repl_that_will_not_restart_raises(self, k8s_agent_sandbox):
+        client = MagicMock()
+        sandbox = _fake_sandbox({"logs": "", "output": None, "is_final_answer": False, "error": None, "version": "0"})
+        client.create_sandbox.return_value = sandbox
+        with pytest.raises(RuntimeError, match="outdated REPL is still serving"):
+            AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+
+    def test_del_triggers_cleanup(self, k8s_agent_sandbox):
+        client = MagicMock()
+        sandbox = _fake_sandbox()
+        client.create_sandbox.return_value = sandbox
+        executor = AgentSandboxExecutor(additional_imports=[], logger=MagicMock(), warmpool="pool", client=client)
+        executor.__del__()
         sandbox.terminate.assert_called_once()
 
     def test_failed_command_surfaces_as_agent_error(self, k8s_agent_sandbox):
