@@ -118,8 +118,8 @@ When working with AI agents that execute code, security is paramount. There are 
 
 ![Sandbox approaches comparison](https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/smolagents/sandboxed_execution.png)
 
-1. **Running individual code snippets in a sandbox**: This approach (left side of diagram) only executes the agent-generated Python code snippets in a sandbox while keeping the rest of the agentic system in your local environment. It's simpler to set up using `executor_type="blaxel"`, `executor_type="e2b"`, `executor_type="modal"`, or
-`executor_type="docker"`, but it doesn't support multi-agents and still requires passing state data between your environment and the sandbox.
+1. **Running individual code snippets in a sandbox**: This approach (left side of diagram) only executes the agent-generated Python code snippets in a sandbox while keeping the rest of the agentic system in your local environment. It's simpler to set up using `executor_type="blaxel"`, `executor_type="e2b"`, `executor_type="modal"`,
+`executor_type="docker"`, or `executor_type="agent-sandbox"`, but it doesn't support multi-agents and still requires passing state data between your environment and the sandbox.
 
 2. **Running the entire agentic system in a sandbox**: This approach (right side of diagram) runs the entire agentic system, including the agent, model, and tools, within a sandbox environment. This provides better isolation but requires more manual setup and may require passing sensitive credentials (like API keys) to the sandbox environment.
 
@@ -432,9 +432,61 @@ finally:
     sandbox.cleanup()
 ```
 
+### Agent Sandbox setup
+
+[Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) is a Kubernetes SIG project that manages
+isolated, stateful sandbox pods through a `Sandbox` custom resource. Use it when the agent has to run on
+infrastructure you operate: the code never leaves your cluster, the sandbox authenticates with its own
+ServiceAccount instead of an API key, and the pod can be hardened with gVisor or Kata.
+
+#### Installation
+
+1. Install the [agent-sandbox controller](https://agent-sandbox.sigs.k8s.io/docs/getting_started/) in your cluster,
+   and create a `SandboxWarmPool` whose image ships a Python interpreter.
+2. Install the extra:
+```bash
+pip install 'smolagents[agent-sandbox]'
+```
+
+#### Running your agent with Agent Sandbox: quick start
+
+Add `executor_type="agent-sandbox"` and name the warm pool to claim from:
+
+```py
+from smolagents import CodeAgent, InferenceClientModel
+
+with CodeAgent(
+    model=InferenceClientModel(),
+    tools=[],
+    executor_type="agent-sandbox",
+    executor_kwargs={"warmpool": "python-sandbox-pool", "namespace": "default"},
+) as agent:
+    agent.run("Can you give me the 100th Fibonacci number?")
+```
+
+Claiming from a `SandboxWarmPool` keeps start-up latency low, since the controller keeps pods pre-warmed.
+
+#### Reusing a sandbox across runs
+
+A `Sandbox` is a long-lived pod with persistent storage, not a disposable container. Passing `claim_name`
+re-attaches to an existing claim, so the working directory and any packages installed by an earlier run are
+still there. Re-attached sandboxes are never deleted on cleanup:
+
+```py
+with CodeAgent(
+    model=InferenceClientModel(),
+    tools=[],
+    executor_type="agent-sandbox",
+    executor_kwargs={"claim_name": "sandbox-claim-abc123"},
+) as agent:
+    agent.run("What did the previous run write to results.csv?")
+```
+
+Pass `shutdown_after_seconds` to have the controller delete an idle claim automatically.
+
 ### Best practices for sandboxes
 
-These key practices apply to Blaxel, E2B, and Docker sandboxes:
+These key practices apply to Blaxel, E2B, Docker, and Agent Sandbox sandboxes:
 
 - Resource management
   - Set memory and CPU limits
@@ -460,7 +512,7 @@ As illustrated in the diagram earlier, both sandboxing approaches have different
 
 ### Approach 1: Running just the code snippets in a sandbox
 - **Pros**: 
-  - Easier to set up with a simple parameter (`executor_type="blaxel"`, `executor_type="e2b"`, or `executor_type="docker"`)
+  - Easier to set up with a simple parameter (`executor_type="blaxel"`, `executor_type="e2b"`, `executor_type="docker"`, or `executor_type="agent-sandbox"`)
   - No need to transfer API keys to the sandbox
   - Better protection for your local environment
   - Fast execution with Blaxel's hibernation technology (<25ms startup)

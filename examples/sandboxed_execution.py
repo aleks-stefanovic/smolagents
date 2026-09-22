@@ -22,3 +22,13 @@ print("E2B executor result:", output)
 with CodeAgent(tools=[WebSearchTool()], model=model, executor_type="modal") as agent:
     output = agent.run("How many seconds would it take for a leopard at full speed to run through Pont des Arts?")
 print("Modal executor result:", output)
+
+# Agent Sandbox executor example: requires an agent-sandbox controller and a SandboxWarmPool
+with CodeAgent(
+    tools=[WebSearchTool()],
+    model=model,
+    executor_type="agent-sandbox",
+    executor_kwargs={"warmpool": "python-sandbox-pool"},
+) as agent:
+    output = agent.run("How many seconds would it take for a leopard at full speed to run through Pont des Arts?")
+print("Agent Sandbox executor result:", output)

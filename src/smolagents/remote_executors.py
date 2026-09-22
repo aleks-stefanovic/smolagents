@@ -39,7 +39,7 @@ from .tools import Tool, get_tools_definition_code
 from .utils import AgentError
 
 
-__all__ = ["BlaxelExecutor", "E2BExecutor", "ModalExecutor", "DockerExecutor"]
+__all__ = ["AgentSandboxExecutor", "BlaxelExecutor", "E2BExecutor", "ModalExecutor", "DockerExecutor"]
 
 
 try:
@@ -1070,6 +1070,381 @@ class BlaxelExecutor(RemotePythonExecutor):
 
     def __del__(self):
         """Ensure cleanup on deletion."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Silently ignore errors during cleanup
+
+
+_AGENT_SANDBOX_REPL_VERSION = "1"
+_AGENT_SANDBOX_SHUTDOWN = "\x00__SMOLAGENTS_SHUTDOWN__"
+
+_AGENT_SANDBOX_REPL = r'''
+"""Persistent Python REPL used by smolagents' AgentSandboxExecutor.
+
+Runs as a daemon inside the Sandbox pod so that variables, imported modules and tool
+definitions survive across separate execution requests. Started with "serve", queried with
+"exec". Uses only the standard library, and is driven through single-argument commands so it
+works on sandbox runtimes that execute without a shell.
+"""
+
+import ast
+import base64
+import contextlib
+import io
+import json
+import os
+import socket
+import sys
+import traceback
+
+
+NAMESPACE = {"__name__": "__main__"}
+
+# Carries a NUL so it can never collide with real agent code.
+SHUTDOWN = "\x00__SMOLAGENTS_SHUTDOWN__"
+
+
+def execute(code):
+    buffer = io.StringIO()
+    output = None
+    is_final_answer = False
+    error = None
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return {"logs": "", "output": None, "is_final_answer": False, "error": traceback.format_exc()}
+
+    body = tree.body
+    trailing_expression = None
+    if body and isinstance(body[-1], ast.Expr):
+        trailing_expression = ast.Expression(body[-1].value)
+        body = body[:-1]
+
+    try:
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            if body:
+                exec(compile(ast.Module(body=body, type_ignores=[]), "<agent>", "exec"), NAMESPACE)
+            if trailing_expression is not None:
+                value = eval(compile(trailing_expression, "<agent>", "eval"), NAMESPACE)
+                if value is not None:
+                    output = repr(value)
+    except BaseException as exception:
+        # Matched by name because the sandbox never imports smolagents itself.
+        if type(exception).__name__ == "FinalAnswerException":
+            output = str(exception)
+            is_final_answer = True
+        else:
+            error = traceback.format_exc()
+
+    return {"logs": buffer.getvalue(), "output": output, "is_final_answer": is_final_answer, "error": error}
+
+
+def detach():
+    """Double-fork so the invoking command returns instead of blocking on the daemon."""
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+
+
+def serve(port, packages_dir=None, version=""):
+    if packages_dir:
+        # Created up front: a sys.path entry that does not exist yet gets a negative finder
+        # cached on the first import, hiding anything installed into it later.
+        os.makedirs(packages_dir, exist_ok=True)
+        sys.path.insert(0, packages_dir)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind(("127.0.0.1", port))
+    except OSError:
+        # A daemon from an earlier session is already serving this sandbox.
+        return
+    # Listening before detaching means the caller cannot race ahead of the accept loop.
+    server.listen(8)
+    detach()
+    while True:
+        connection, _ = server.accept()
+        with contextlib.closing(connection):
+            payload = b""
+            while not payload.endswith(b"\n"):
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                payload += chunk
+            if not payload.strip():
+                continue
+            code = base64.b64decode(payload.strip()).decode("utf-8")
+            if code == SHUTDOWN:
+                connection.sendall((json.dumps({"version": version}) + "\n").encode("utf-8"))
+                return
+            result = execute(code)
+            result["version"] = version
+            connection.sendall((json.dumps(result) + "\n").encode("utf-8"))
+
+
+def request(port, argument):
+    # An oversized payload is staged in a file, since a single argv token is bounded by ARG_MAX.
+    if argument.startswith("@"):
+        with open(argument[1:]) as payload_file:
+            argument = payload_file.read().strip()
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect(("127.0.0.1", port))
+    with contextlib.closing(client):
+        client.sendall(argument.encode("utf-8") + b"\n")
+        response = b""
+        while not response.endswith(b"\n"):
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            response += chunk
+    sys.stdout.write(response.decode("utf-8"))
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "serve":
+        serve(
+            int(sys.argv[2]),
+            sys.argv[3] if len(sys.argv) > 3 else None,
+            sys.argv[4] if len(sys.argv) > 4 else "",
+        )
+    else:
+        request(int(sys.argv[2]), sys.argv[3])
+'''
+
+
+class AgentSandboxExecutor(RemotePythonExecutor):
+    """
+    Remote Python code executor in a Kubernetes Sandbox managed by the
+    [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox) controller.
+
+    Unlike the SaaS-backed executors, this runs on a cluster you operate: code never leaves your
+    network, the sandbox authenticates with its own ServiceAccount rather than an API key, and the
+    workload can be hardened with gVisor or Kata. Because a Sandbox is a long-lived pod with
+    persistent storage, passing `claim_name` re-attaches to an existing session, so a working
+    directory and previously installed packages survive across agent runs.
+
+    The executor uploads a small standard-library REPL into the sandbox and drives it with
+    single-argument commands, so it needs no purpose-built image: any sandbox runtime with a
+    Python interpreter works, with or without a shell.
+
+    Args:
+        additional_imports (`list[str]`): Additional Python packages to install.
+        logger (`Logger`): Logger to use for output and errors.
+        allow_pickle (`bool`, default `False`): Whether to allow pickle serialization for objects that cannot be safely serialized to JSON.
+            - `False` (default, recommended): Only safe JSON serialization is used. Raises error if object cannot be safely serialized.
+            - `True` (legacy mode): Tries safe JSON serialization first, falls back to pickle with warning if needed.
+
+            **Security Warning:** Pickle deserialization can execute arbitrary code. Only set `allow_pickle=True`
+            if you fully trust the execution environment and need backward compatibility with custom types.
+        warmpool (`str`, *optional*): Name of the `SandboxWarmPool` to claim a Sandbox from. Required unless
+            `claim_name` is given.
+        namespace (`str`, default `"default"`): Kubernetes namespace holding the claim.
+        claim_name (`str`, *optional*): Re-attach to the Sandbox of an existing `SandboxClaim` instead of
+            claiming a new one. Implies `keep_alive=True`.
+        connection_config (*optional*): `k8s_agent_sandbox` connection config. Defaults to the client's own
+            default, which port-forwards to the sandbox-router.
+        shutdown_after_seconds (`int`, *optional*): TTL after which the controller deletes the claim.
+        sandbox_ready_timeout (`int`, default `180`): Seconds to wait for the Sandbox to become ready.
+        keep_alive (`bool`, default `False`): Leave the Sandbox running on cleanup instead of deleting it.
+        python_executable (`str`, default `"python3"`): Python interpreter inside the sandbox image.
+        repl_path (`str`, default `"smolagents_repl.py"`): Where to upload the REPL, relative to the sandbox
+            runtime's base directory.
+        repl_port (`int`, default `8765`): Loopback port the REPL listens on inside the pod.
+        packages_path (`str`, default `"/tmp/smolagents-packages"`): Writable directory that `pip install`
+            targets and that the REPL adds to `sys.path`.
+        payload_path (`str`, default `"smolagents_payload.b64"`): Where oversized execution payloads are
+            staged, relative to the sandbox runtime's base directory.
+        max_inline_payload (`int`, default `65536`): Payloads longer than this are staged in a file rather
+            than passed as a command argument.
+        command_timeout (`int`, default `300`): Per-execution timeout in seconds.
+        client (*optional*): Pre-built `k8s_agent_sandbox.SandboxClient`, mainly for testing.
+    """
+
+    def __init__(
+        self,
+        additional_imports: list[str],
+        logger,
+        allow_pickle: bool = False,
+        warmpool: str | None = None,
+        namespace: str = "default",
+        claim_name: str | None = None,
+        connection_config: Any = None,
+        shutdown_after_seconds: int | None = None,
+        sandbox_ready_timeout: int = 180,
+        keep_alive: bool = False,
+        python_executable: str = "python3",
+        repl_path: str = "smolagents_repl.py",
+        repl_port: int = 8765,
+        packages_path: str = "/tmp/smolagents-packages",
+        payload_path: str = "smolagents_payload.b64",
+        max_inline_payload: int = 64 * 1024,
+        command_timeout: int = 300,
+        client: Any = None,
+    ):
+        super().__init__(additional_imports, logger, allow_pickle)
+        try:
+            from k8s_agent_sandbox import SandboxClient
+        except ModuleNotFoundError:
+            raise ModuleNotFoundError(
+                "Please install 'agent-sandbox' extra to use AgentSandboxExecutor: "
+                "`pip install 'smolagents[agent-sandbox]'`"
+            )
+        if not warmpool and not claim_name:
+            raise ValueError("AgentSandboxExecutor requires either `warmpool` or `claim_name`.")
+
+        self.namespace = namespace
+        self.python_executable = python_executable
+        self.repl_path = repl_path
+        self.repl_port = repl_port
+        self.packages_path = packages_path
+        self.payload_path = payload_path
+        self.max_inline_payload = max_inline_payload
+        self.command_timeout = command_timeout
+        self.keep_alive = keep_alive or claim_name is not None
+
+        client_kwargs = {"connection_config": connection_config} if connection_config is not None else {}
+        self.client = client or SandboxClient(**client_kwargs)
+
+        if claim_name:
+            self.logger.log(f"Re-attaching to Sandbox claim {claim_name}", level=LogLevel.INFO)
+            self.sandbox = self.client.get_sandbox(claim_name, namespace)
+        else:
+            self.logger.log(f"Claiming a Sandbox from warm pool {warmpool}", level=LogLevel.INFO)
+            self.sandbox = self.client.create_sandbox(
+                warmpool=warmpool,
+                namespace=namespace,
+                sandbox_ready_timeout=sandbox_ready_timeout,
+                shutdown_after_seconds=shutdown_after_seconds,
+            )
+
+        try:
+            self._start_repl()
+            self.installed_packages = self.install_packages(additional_imports)
+        except Exception as e:
+            self.cleanup()
+            raise RuntimeError(f"Failed to initialize the sandbox REPL: {e}") from e
+
+        self.logger.log(f"Sandbox {self.sandbox.claim_name} is ready", level=LogLevel.INFO)
+
+    def _run_command(self, command: str, timeout: int | None = None):
+        result = self.sandbox.commands.run(command, timeout=timeout or self.command_timeout)
+        if result.exit_code != 0:
+            raise AgentError(
+                f"Sandbox command failed ({result.exit_code}): {result.stderr or result.stdout}", self.logger
+            )
+        return result
+
+    def _start_repl(self):
+        self.sandbox.files.write(self.repl_path, _AGENT_SANDBOX_REPL)
+        self._serve_repl()
+        if self._wait_for_repl() == _AGENT_SANDBOX_REPL_VERSION:
+            return
+        # Re-attaching can find a daemon left by an older smolagents, still serving its own REPL
+        # code and package path. Replace it rather than reuse it; its interpreter state is lost.
+        self.logger.log("Replacing an outdated REPL in the sandbox; its state is discarded.", level=LogLevel.INFO)
+        try:
+            self._request(_AGENT_SANDBOX_SHUTDOWN)
+        except Exception:
+            pass
+        self._serve_repl()
+        if self._wait_for_repl() != _AGENT_SANDBOX_REPL_VERSION:
+            raise RuntimeError(
+                f"An outdated REPL is still serving on port {self.repl_port} and would not shut down. "
+                "Claim a new sandbox instead of re-attaching to this one."
+            )
+
+    def _serve_repl(self):
+        self._run_command(
+            f"{self.python_executable} {self.repl_path} serve "
+            f"{self.repl_port} {self.packages_path} {_AGENT_SANDBOX_REPL_VERSION}"
+        )
+
+    def _wait_for_repl(self, attempts: int = 10) -> str:
+        for attempt in range(attempts):
+            try:
+                return self._request("pass").get("version", "")
+            except Exception:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(1.0)
+
+    def _request(self, code: str) -> dict:
+        encoded_code = base64.b64encode(code.encode("utf-8")).decode("utf-8")
+        if len(encoded_code) > self.max_inline_payload:
+            # A single argv token is bounded by ARG_MAX, and send_variables can serialize megabytes.
+            self.sandbox.files.write(self.payload_path, encoded_code)
+            argument = f"@{self.payload_path}"
+        else:
+            argument = encoded_code
+        result = self._run_command(f"{self.python_executable} {self.repl_path} exec {self.repl_port} {argument}")
+        try:
+            return json.loads(result.stdout)
+        except ValueError as e:
+            raise RuntimeError(f"Malformed REPL response: {result.stdout!r} {result.stderr!r}") from e
+
+    def run_code_raise_errors(self, code: str) -> CodeOutput:
+        """
+        Execute Python code in the Sandbox and return the result.
+
+        Args:
+            code (`str`): Python code to execute.
+
+        Returns:
+            `CodeOutput`: Code output containing the result, logs, and whether it is the final answer.
+        """
+        payload = self._request(code)
+        logs = payload["logs"]
+        if payload["is_final_answer"]:
+            return CodeOutput(
+                output=self._deserialize_final_answer(payload["output"], self.allow_pickle),
+                logs=logs,
+                is_final_answer=True,
+            )
+        if payload["error"]:
+            raise AgentError(f"{logs}\nExecuting code yielded an error:\n{payload['error']}", self.logger)
+        return CodeOutput(output=payload["output"], logs=logs, is_final_answer=False)
+
+    def install_packages(self, additional_imports: list[str]):
+        """Install packages with pip inside the sandbox."""
+        if not additional_imports:
+            return additional_imports
+        # Sandbox images commonly run as a non-root user with no writable site-packages or HOME,
+        # so install into a directory the REPL has already put on sys.path.
+        result = self._run_command(
+            f"{self.python_executable} -m pip install --target {self.packages_path} {' '.join(additional_imports)}",
+            timeout=max(self.command_timeout, 600),
+        )
+        self.logger.log(result.stdout)
+        self._request("import importlib; importlib.invalidate_caches()")
+        return additional_imports
+
+    def cleanup(self):
+        """Delete the Sandbox, unless it is being kept alive for reuse."""
+        sandbox = getattr(self, "sandbox", None)
+        if sandbox is None:
+            return
+        try:
+            if self.keep_alive:
+                self.logger.log(f"Leaving Sandbox claim {sandbox.claim_name} running", level=LogLevel.INFO)
+                sandbox.close_connection()
+            else:
+                self.logger.log(f"Deleting Sandbox claim {sandbox.claim_name}", level=LogLevel.INFO)
+                sandbox.terminate()
+        except Exception as e:
+            self.logger.log_error(f"Error during sandbox cleanup: {e}")
+
+    def delete(self):
+        """Ensure cleanup on deletion."""
+        self.cleanup()
+
+    def __del__(self):
+        """Ensure cleanup on garbage collection."""
         try:
             self.cleanup()
         except Exception:
